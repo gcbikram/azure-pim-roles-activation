@@ -101,10 +101,41 @@ function Get-AzureResourceEligibleRoles {
         $url = "https://management.azure.com/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&`$filter=asTarget()"
         $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
         
+        # Cache for role definitions to avoid multiple API calls for the same role
+        $roleDefinitionCache = @{
+        }
+        
         $azureRoles = @()
         foreach ($assignment in $response.value) {
             $scope = $assignment.properties.scope
             $scopeParts = $scope -split '/'
+            $roleDefinitionId = $assignment.properties.roleDefinitionId
+            
+            # Get the role display name - first try from the response
+            $roleDisplayName = $assignment.properties.roleDefinitionDisplayName
+            
+            # If display name is missing, look it up from the role definition
+            if ([string]::IsNullOrWhiteSpace($roleDisplayName)) {
+                if ($roleDefinitionCache.ContainsKey($roleDefinitionId)) {
+                    $roleDisplayName = $roleDefinitionCache[$roleDefinitionId]
+                } else {
+                    try {
+                        # Look up the role definition to get the display name
+                        $roleDefUrl = "https://management.azure.com$roleDefinitionId" + "?api-version=2022-04-01"
+                        $roleDefResponse = Invoke-RestMethod -Uri $roleDefUrl -Headers $headers -Method Get
+                        $roleDisplayName = $roleDefResponse.properties.roleName
+                        
+                        # Cache the result
+                        $roleDefinitionCache[$roleDefinitionId] = $roleDisplayName
+                        
+                        Write-Host "   Retrieved role name: $roleDisplayName" -ForegroundColor Gray
+                    }
+                    catch {
+                        Write-Host "Warning: Could not retrieve role definition for $roleDefinitionId : $($_.Exception.Message)" -ForegroundColor Yellow
+                        $roleDisplayName = "Unknown Role ($($roleDefinitionId.Split('/')[-1]))"
+                    }
+                }
+            }
             
             # Determine scope display name and type
             $scopeDisplayName = $scope
@@ -133,8 +164,8 @@ function Get-AzureResourceEligibleRoles {
             }
             
             $azureRoles += [PSCustomObject]@{
-                DisplayName = $assignment.properties.roleDefinitionDisplayName
-                RoleDefinitionId = $assignment.properties.roleDefinitionId
+                DisplayName = $roleDisplayName
+                RoleDefinitionId = $roleDefinitionId
                 PrincipalId = $assignment.properties.principalId
                 Scope = $scope
                 ScopeDisplayName = $scopeDisplayName
@@ -143,6 +174,7 @@ function Get-AzureResourceEligibleRoles {
             }
         }
         
+        Write-Host "   Found $($azureRoles.Count) Azure resource eligible roles" -ForegroundColor Gray
         return $azureRoles
     }
     catch {
@@ -165,21 +197,24 @@ function Test-RoleActiveStatus {
             return $activeAssignments.Count -gt 0
         }
         else {
-            # Check for active Azure resource role assignments
+            # Check for active Azure resource role assignments using simplified approach
             $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
-            $headers = @{ Authorization = "Bearer $token" }
+            $headers = @{ 
+                Authorization = "Bearer $token"
+                'Content-Type' = 'application/json'
+            }
             
-            # Check for active role assignment schedule instances
-            $encodedScope = [System.Web.HttpUtility]::UrlEncode($Role.Scope)
-            $url = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&`$filter=asTarget() and principalId eq '$CurrentUserObjectId' and roleDefinitionId eq '$($Role.RoleDefinitionId)' and scope eq '$($Role.Scope)'"
+            # Use a simpler filter approach that's more reliable
+            $url = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&`$filter=asTarget()"
             
             $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction SilentlyContinue
             
-            # Check if there are any active assignments
+            # Check if there are any active assignments matching our criteria
             $activeAssignments = $response.value | Where-Object { 
-                $_.properties.status -eq "Accepted" -and 
+                $_.properties.principalId -eq $CurrentUserObjectId -and
+                $_.properties.roleDefinitionId -eq $Role.RoleDefinitionId -and
                 $_.properties.scope -eq $Role.Scope -and
-                $_.properties.roleDefinitionId -eq $Role.RoleDefinitionId
+                $_.properties.status -eq "Accepted"
             }
             
             return $activeAssignments.Count -gt 0
@@ -187,6 +222,19 @@ function Test-RoleActiveStatus {
     }
     catch {
         Write-Host "Warning: Could not check active status for $($Role.DisplayName): $($_.Exception.Message)" -ForegroundColor Yellow
+        
+        # If we can't check status, try a different approach for Azure resources
+        if ($Role.RoleType -eq "Azure Resource") {
+            try {
+                # Fallback: Try to get existing role assignments using Get-AzRoleAssignment
+                $existingAssignments = Get-AzRoleAssignment -Scope $Role.Scope -RoleDefinitionId $Role.RoleDefinitionId -ObjectId $CurrentUserObjectId -ErrorAction SilentlyContinue
+                return $existingAssignments.Count -gt 0
+            }
+            catch {
+                Write-Host "   Fallback check also failed, proceeding with activation attempt" -ForegroundColor Gray
+            }
+        }
+        
         return $false  # Assume not active if we can't check
     }
 }
@@ -201,12 +249,13 @@ function Invoke-RoleActivation {
     
     try {
         # Check if role is already active
-        if (Test-RoleActiveStatus -Role $Role -CurrentUserObjectId $CurrentUserObjectId) {
-            Write-Host "⚠ Role already active: $($Role.DisplayName)" -ForegroundColor Yellow
+        $isActive = Test-RoleActiveStatus -Role $Role -CurrentUserObjectId $CurrentUserObjectId
+        if ($isActive) {
+            Write-Host "⚠ Role already active: $($Role.DisplayName) ($($Role.ScopeDisplayName))" -ForegroundColor Yellow
             return $true
         }
         
-        Write-Host "Activating $($Role.RoleType) role: $($Role.DisplayName)..." -ForegroundColor Yellow
+        Write-Host "Activating $($Role.RoleType) role: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName)..." -ForegroundColor Yellow
         
         if ($Role.RoleType -eq "Entra ID") {
             # Entra ID role activation
@@ -228,30 +277,48 @@ function Invoke-RoleActivation {
             New-MgRoleManagementDirectoryRoleAssignmentScheduleRequest -BodyParameter $params
         }
         else {
-            # Azure resource role activation - use the passed CurrentUserObjectId
+            # Azure resource role activation
             $guid = [guid]::NewGuid().ToString()
             $startTime = (Get-Date).ToString("o")
             
-            # Use the current user's object ID as the principal ID for self-activation
-            New-AzRoleAssignmentScheduleRequest `
-                -Name $guid `
-                -Scope $Role.Scope `
-                -ExpirationDuration "PT8H" `
-                -ExpirationType "AfterDuration" `
-                -PrincipalId $CurrentUserObjectId `
-                -RequestType "SelfActivate" `
-                -RoleDefinitionId $Role.RoleDefinitionId `
-                -ScheduleInfoStartDateTime $startTime `
-                -Justification $Justification
+            # Try activation and handle "already exists" error gracefully
+            try {
+                New-AzRoleAssignmentScheduleRequest `
+                    -Name $guid `
+                    -Scope $Role.Scope `
+                    -ExpirationDuration "PT8H" `
+                    -ExpirationType "AfterDuration" `
+                    -PrincipalId $CurrentUserObjectId `
+                    -RequestType "SelfActivate" `
+                    -RoleDefinitionId $Role.RoleDefinitionId `
+                    -ScheduleInfoStartDateTime $startTime `
+                    -Justification $Justification
+            }
+            catch {
+                if ($_.Exception.Message -like "*already exists*" -or $_.Exception.Message -like "*Role assignment already exists*") {
+                    Write-Host "⚠ Role already active (detected during activation): $($Role.DisplayName) ($($Role.ScopeDisplayName))" -ForegroundColor Yellow
+                    return $true
+                }
+                else {
+                    throw  # Re-throw if it's a different error
+                }
+            }
         }
         
-        Write-Host "✓ Successfully activated: $($Role.DisplayName)" -ForegroundColor Green
+        Write-Host "✓ Successfully activated: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName)" -ForegroundColor Green
         return $true
     }
     catch {
-        Write-Host "✗ Failed to activate $($Role.DisplayName): $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "   Scope: $($Role.Scope)" -ForegroundColor Gray
-        return $false
+        # Handle specific error cases more gracefully
+        $errorMessage = $_.Exception.Message
+        if ($errorMessage -like "*already exists*" -or $errorMessage -like "*Role assignment already exists*") {
+            Write-Host "⚠ Role already active: $($Role.DisplayName) ($($Role.ScopeDisplayName))" -ForegroundColor Yellow
+            return $true
+        }
+        else {
+            Write-Host "✗ Failed to activate $($Role.DisplayName) at scope: $($Role.ScopeDisplayName): $errorMessage" -ForegroundColor Red
+            return $false
+        }
     }
 }
 
