@@ -88,14 +88,27 @@ function Show-AvailableRoles {
     }
 }
 
+# Function to get Azure ARM headers (reusable)
+function Get-AzureARMHeaders {
+    try {
+        $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
+        return @{ 
+            Authorization = "Bearer $token"
+            'Content-Type' = 'application/json'
+        }
+    }
+    catch {
+        throw "Failed to get Azure ARM access token: $($_.Exception.Message)"
+    }
+}
+
 # Function to get Azure resource eligible roles
 function Get-AzureResourceEligibleRoles {
     try {
         Write-Host "Retrieving Azure resource PIM eligible roles..." -ForegroundColor Gray
         
-        # Get access token for ARM
-        $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
-        $headers = @{ Authorization = "Bearer $token" }
+        # Use reusable headers function
+        $headers = Get-AzureARMHeaders
         
         # Use the correct ARM API endpoint
         $url = "https://management.azure.com/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&`$filter=asTarget()"
@@ -108,7 +121,6 @@ function Get-AzureResourceEligibleRoles {
         $azureRoles = @()
         foreach ($assignment in $response.value) {
             $scope = $assignment.properties.scope
-            $scopeParts = $scope -split '/'
             $roleDefinitionId = $assignment.properties.roleDefinitionId
             
             # Get the role display name - first try from the response
@@ -137,39 +149,16 @@ function Get-AzureResourceEligibleRoles {
                 }
             }
             
-            # Determine scope display name and type
-            $scopeDisplayName = $scope
-            $scopeType = "Resource"
-            
-            if ($scope -match '/subscriptions/([^/]+)') {
-                $subId = $matches[1]
-                if ($scope -match '/resourceGroups/([^/]+)') {
-                    $rgName = $matches[1]
-                    $scopeType = "Resource Group"
-                    $scopeDisplayName = "RG: $rgName"
-                } elseif ($scope -match '/providers/([^/]+)/([^/]+)/([^/]+)') {
-                    $resourceType = $matches[2]
-                    $resourceName = $matches[3]
-                    $scopeType = "Resource"
-                    $scopeDisplayName = "$resourceType`: $resourceName"
-                } else {
-                    $scopeType = "Subscription"
-                    try {
-                        $sub = Get-AzSubscription -SubscriptionId $subId -ErrorAction SilentlyContinue
-                        $scopeDisplayName = "Sub: $($sub.Name)"
-                    } catch {
-                        $scopeDisplayName = "Sub: $subId"
-                    }
-                }
-            }
+            # Use helper function for scope parsing
+            $scopeInfo = Get-ScopeDisplayInfo -Scope $scope
             
             $azureRoles += [PSCustomObject]@{
                 DisplayName = $roleDisplayName
                 RoleDefinitionId = $roleDefinitionId
                 PrincipalId = $assignment.properties.principalId
                 Scope = $scope
-                ScopeDisplayName = $scopeDisplayName
-                ScopeType = $scopeType
+                ScopeDisplayName = $scopeInfo.DisplayName
+                ScopeType = $scopeInfo.Type
                 RoleType = "Azure Resource"
             }
         }
@@ -183,59 +172,38 @@ function Get-AzureResourceEligibleRoles {
     }
 }
 
-# Function to check if a role is already active
-function Test-RoleActiveStatus {
-    param(
-        [PSCustomObject]$Role,
-        [string]$CurrentUserObjectId
-    )
+# Function to parse scope information (reusable)
+function Get-ScopeDisplayInfo {
+    param([string]$Scope)
     
-    try {
-        if ($Role.RoleType -eq "Entra ID") {
-            # Check for active Entra ID role assignments
-            $activeAssignments = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -Filter "principalId eq '$($Role.PrincipalId)' and roleDefinitionId eq '$($Role.RoleDefinitionId)' and directoryScopeId eq '$($Role.DirectoryScopeId)'" -ErrorAction SilentlyContinue
-            return $activeAssignments.Count -gt 0
-        }
-        else {
-            # Check for active Azure resource role assignments using simplified approach
-            $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
-            $headers = @{ 
-                Authorization = "Bearer $token"
-                'Content-Type' = 'application/json'
+    $scopeDisplayName = $Scope
+    $scopeType = "Resource"
+    
+    if ($Scope -match '/subscriptions/([^/]+)') {
+        $subId = $matches[1]
+        if ($Scope -match '/resourceGroups/([^/]+)') {
+            $rgName = $matches[1]
+            $scopeType = "Resource Group"
+            $scopeDisplayName = "RG: $rgName"
+        } elseif ($Scope -match '/providers/([^/]+)/([^/]+)/([^/]+)') {
+            $resourceType = $matches[2]
+            $resourceName = $matches[3]
+            $scopeType = "Resource"
+            $scopeDisplayName = "$resourceType`: $resourceName"
+        } else {
+            $scopeType = "Subscription"
+            try {
+                $sub = Get-AzSubscription -SubscriptionId $subId -ErrorAction SilentlyContinue
+                $scopeDisplayName = "Sub: $($sub.Name)"
+            } catch {
+                $scopeDisplayName = "Sub: $subId"
             }
-            
-            # Use a simpler filter approach that's more reliable
-            $url = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&`$filter=asTarget()"
-            
-            $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction SilentlyContinue
-            
-            # Check if there are any active assignments matching our criteria
-            $activeAssignments = $response.value | Where-Object { 
-                $_.properties.principalId -eq $CurrentUserObjectId -and
-                $_.properties.roleDefinitionId -eq $Role.RoleDefinitionId -and
-                $_.properties.scope -eq $Role.Scope -and
-                $_.properties.status -eq "Accepted"
-            }
-            
-            return $activeAssignments.Count -gt 0
         }
     }
-    catch {
-        Write-Host "Warning: Could not check active status for $($Role.DisplayName): $($_.Exception.Message)" -ForegroundColor Yellow
-        
-        # If we can't check status, try a different approach for Azure resources
-        if ($Role.RoleType -eq "Azure Resource") {
-            try {
-                # Fallback: Try to get existing role assignments using Get-AzRoleAssignment
-                $existingAssignments = Get-AzRoleAssignment -Scope $Role.Scope -RoleDefinitionId $Role.RoleDefinitionId -ObjectId $CurrentUserObjectId -ErrorAction SilentlyContinue
-                return $existingAssignments.Count -gt 0
-            }
-            catch {
-                Write-Host "   Fallback check also failed, proceeding with activation attempt" -ForegroundColor Gray
-            }
-        }
-        
-        return $false  # Assume not active if we can't check
+    
+    return @{
+        DisplayName = $scopeDisplayName
+        Type = $scopeType
     }
 }
 
@@ -248,13 +216,6 @@ function Invoke-RoleActivation {
     )
     
     try {
-        # Check if role is already active
-        $isActive = Test-RoleActiveStatus -Role $Role -CurrentUserObjectId $CurrentUserObjectId
-        if ($isActive) {
-            Write-Host "⚠ Role already active: $($Role.DisplayName) ($($Role.ScopeDisplayName))" -ForegroundColor Yellow
-            return $true
-        }
-        
         Write-Host "Activating $($Role.RoleType) role: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName)..." -ForegroundColor Yellow
         
         if ($Role.RoleType -eq "Entra ID") {
@@ -281,9 +242,9 @@ function Invoke-RoleActivation {
             $guid = [guid]::NewGuid().ToString()
             $startTime = (Get-Date).ToString("o")
             
-            # Try activation and handle "already exists" error gracefully
+            # Try activation with error suppression and proper handling
             try {
-                New-AzRoleAssignmentScheduleRequest `
+                $result = New-AzRoleAssignmentScheduleRequest `
                     -Name $guid `
                     -Scope $Role.Scope `
                     -ExpirationDuration "PT8H" `
@@ -292,10 +253,12 @@ function Invoke-RoleActivation {
                     -RequestType "SelfActivate" `
                     -RoleDefinitionId $Role.RoleDefinitionId `
                     -ScheduleInfoStartDateTime $startTime `
-                    -Justification $Justification
+                    -Justification $Justification `
+                    -ErrorAction Stop 2>$null
             }
             catch {
-                if ($_.Exception.Message -like "*already exists*" -or $_.Exception.Message -like "*Role assignment already exists*") {
+                $errorMessage = $_.Exception.Message
+                if ($errorMessage -like "*already exists*" -or $errorMessage -like "*Role assignment already exists*") {
                     Write-Host "⚠ Role already active (detected during activation): $($Role.DisplayName) ($($Role.ScopeDisplayName))" -ForegroundColor Yellow
                     return $true
                 }
@@ -305,7 +268,7 @@ function Invoke-RoleActivation {
             }
         }
         
-        Write-Host "✓ Successfully activated: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName)" -ForegroundColor Green
+        Write-Host "✓ Successfully activated: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName) [Active for 8 hours]" -ForegroundColor Green
         return $true
     }
     catch {
@@ -422,9 +385,10 @@ try {
     }
 
     # Summary
-    Write-Host "`n" + "="*50 -ForegroundColor Green
+    Write-Host "`n"
+    Write-Host ("***") -ForegroundColor Green
     Write-Host "ACTIVATION SUMMARY" -ForegroundColor Green
-    Write-Host "="*50 -ForegroundColor Green
+    Write-Host ("***") -ForegroundColor Green
     Write-Host "Successfully activated: $activatedCount roles" -ForegroundColor Green
     if ($failedCount -gt 0) {
         Write-Host "Failed activations: $failedCount" -ForegroundColor Red
