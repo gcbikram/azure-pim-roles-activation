@@ -91,7 +91,17 @@ function Show-AvailableRoles {
 # Function to get Azure ARM headers (reusable)
 function Get-AzureARMHeaders {
     try {
-        $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
+        $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+        
+        # Handle Az module 14.* breaking change: Token is now SecureString instead of String
+        if ($accessToken.Token -is [System.Security.SecureString]) {
+            # Az 14.0.0+ returns SecureString
+            $token = ConvertFrom-SecureString -SecureString $accessToken.Token -AsPlainText
+        } else {
+            # Az <14.0.0 returns plain string
+            $token = $accessToken.Token
+        }
+        
         return @{ 
             Authorization = "Bearer $token"
             'Content-Type' = 'application/json'
