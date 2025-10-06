@@ -115,36 +115,39 @@ function Get-AzureResourceEligibleRoles {
         $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
         
         # Cache for role definitions to avoid multiple API calls for the same role
-        $roleDefinitionCache = @{
-        }
-        
+        $roleDefinitionCache = @{}
+        $failedRoleDefinitionIds = @{}
+
         $azureRoles = @()
         foreach ($assignment in $response.value) {
             $scope = $assignment.properties.scope
             $roleDefinitionId = $assignment.properties.roleDefinitionId
-            
+
             # Get the role display name - first try from the response
             $roleDisplayName = $assignment.properties.roleDefinitionDisplayName
-            
+
             # If display name is missing, look it up from the role definition
             if ([string]::IsNullOrWhiteSpace($roleDisplayName)) {
                 if ($roleDefinitionCache.ContainsKey($roleDefinitionId)) {
                     $roleDisplayName = $roleDefinitionCache[$roleDefinitionId]
+                } elseif ($failedRoleDefinitionIds.ContainsKey($roleDefinitionId)) {
+                    $roleDisplayName = "Unknown Role ($($roleDefinitionId.Split('/')[-1]))"
                 } else {
                     try {
                         # Look up the role definition to get the display name
                         $roleDefUrl = "https://management.azure.com$roleDefinitionId" + "?api-version=2022-04-01"
                         $roleDefResponse = Invoke-RestMethod -Uri $roleDefUrl -Headers $headers -Method Get
                         $roleDisplayName = $roleDefResponse.properties.roleName
-                        
+
                         # Cache the result
                         $roleDefinitionCache[$roleDefinitionId] = $roleDisplayName
-                        
+
                         Write-Host "   Retrieved role name: $roleDisplayName" -ForegroundColor Gray
                     }
                     catch {
                         Write-Host "Warning: Could not retrieve role definition for $roleDefinitionId : $($_.Exception.Message)" -ForegroundColor Yellow
                         $roleDisplayName = "Unknown Role ($($roleDefinitionId.Split('/')[-1]))"
+                        $failedRoleDefinitionIds[$roleDefinitionId] = $true
                     }
                 }
             }
