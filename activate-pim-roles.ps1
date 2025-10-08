@@ -62,6 +62,8 @@ function Get-EntraIDEligibleRoles {
                 ScopeDisplayName = $scopeDisplayName
                 ScopeType = $scopeType
                 RoleType = "Entra ID"
+                IsActive = $false
+                ActiveAssignmentId = $null
             }
         }
     }
@@ -70,6 +72,65 @@ function Get-EntraIDEligibleRoles {
     }
     
     return $entraRoles
+}
+
+# Function to get active Entra ID role assignments
+function Get-EntraIDActiveRoles {
+    param([string]$CurrentUser)
+    
+    Write-Host "Retrieving active Entra ID PIM roles..." -ForegroundColor Gray
+    $activeRoles = @{
+    }
+    
+    try {
+        $activeAssignments = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -ExpandProperty RoleDefinition -All -Filter "principalId eq '$CurrentUser'"
+        
+        foreach ($assignment in $activeAssignments) {
+            $key = "$($assignment.RoleDefinitionId)|$($assignment.DirectoryScopeId)"
+            $activeRoles[$key] = @{
+                AssignmentId = $assignment.Id
+                ActivatedDateTime = $assignment.StartDateTime
+                ExpirationDateTime = $assignment.EndDateTime
+            }
+        }
+    }
+    catch {
+        Write-Host "Warning: Failed to retrieve active Entra ID roles: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    
+    return $activeRoles
+}
+
+# Function to get active Azure resource role assignments
+function Get-AzureResourceActiveRoles {
+    param([string]$CurrentUserObjectId)
+    
+    Write-Host "Retrieving active Azure resource PIM roles..." -ForegroundColor Gray
+    $activeRoles = @{
+    }
+    
+    try {
+        $headers = Get-AzureARMHeaders
+        $url = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&`$filter=asTarget()"
+        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+        
+        foreach ($assignment in $response.value) {
+            if ($assignment.properties.principalId -eq $CurrentUserObjectId) {
+                $key = "$($assignment.properties.roleDefinitionId)|$($assignment.properties.scope)"
+                $activeRoles[$key] = @{
+                    AssignmentId = $assignment.name
+                    ActivatedDateTime = $assignment.properties.startDateTime
+                    ExpirationDateTime = $assignment.properties.endDateTime
+                    Scope = $assignment.properties.scope
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host "Warning: Failed to retrieve active Azure resource roles: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    
+    return $activeRoles
 }
 
 # Function to display roles in a formatted table
@@ -81,9 +142,15 @@ function Show-AvailableRoles {
     
     for ($i = 0; $i -lt $Roles.Count; $i++) {
         $role = $Roles[$i]
-        Write-Host "$($i + 1). $($role.DisplayName)" -ForegroundColor Yellow
+        $statusIndicator = if ($role.IsActive) { "🟢 ACTIVE" } else { "⚪ Inactive" }
+        
+        Write-Host "$($i + 1). $($role.DisplayName) [$statusIndicator]" -ForegroundColor Yellow
         Write-Host "   Type: $($role.RoleType)" -ForegroundColor Cyan
         Write-Host "   Scope: $($role.ScopeDisplayName) ($($role.ScopeType))" -ForegroundColor Gray
+        
+        if ($role.IsActive -and $role.ExpirationDateTime) {
+            Write-Host "   Expires: $($role.ExpirationDateTime)" -ForegroundColor Magenta
+        }
         Write-Host ""
     }
 }
@@ -93,6 +160,7 @@ function Get-AzureARMHeaders {
     try {
         $accessToken = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
         
+        # https://github.com/Azure/azure-powershell/issues/25533
         # Handle Az module 14.* breaking change: Token is now SecureString instead of String
         if ($accessToken.Token -is [System.Security.SecureString]) {
             # Az 14.0.0+ returns SecureString
@@ -125,8 +193,10 @@ function Get-AzureResourceEligibleRoles {
         $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
         
         # Cache for role definitions to avoid multiple API calls for the same role
-        $roleDefinitionCache = @{}
-        $failedRoleDefinitionIds = @{}
+        $roleDefinitionCache = @{
+        }
+        $failedRoleDefinitionIds = @{
+        }
 
         $azureRoles = @()
         foreach ($assignment in $response.value) {
@@ -173,6 +243,9 @@ function Get-AzureResourceEligibleRoles {
                 ScopeDisplayName = $scopeInfo.DisplayName
                 ScopeType = $scopeInfo.Type
                 RoleType = "Azure Resource"
+                IsActive = $false
+                ActiveAssignmentId = $null
+                ExpirationDateTime = $null
             }
         }
         
@@ -220,6 +293,57 @@ function Get-ScopeDisplayInfo {
     }
 }
 
+# Function to deactivate a single role
+function Invoke-RoleDeactivation {
+    param(
+        [PSCustomObject]$Role,
+        [string]$CurrentUserObjectId
+    )
+    
+    try {
+        Write-Host "Deactivating $($Role.RoleType) role: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName)..." -ForegroundColor Yellow
+        
+        if ($Role.RoleType -eq "Entra ID") {
+            # Entra ID role deactivation
+            $params = @{
+                Action = "selfDeactivate"
+                PrincipalId = $Role.PrincipalId
+                RoleDefinitionId = $Role.RoleDefinitionId
+                DirectoryScopeId = $Role.DirectoryScopeId
+            }
+            
+            New-MgRoleManagementDirectoryRoleAssignmentScheduleRequest -BodyParameter $params | Out-Null
+        }
+        else {
+            # Azure resource role deactivation
+            $guid = [guid]::NewGuid().ToString()
+            
+            try {
+                New-AzRoleAssignmentScheduleRequest `
+                    -Name $guid `
+                    -Scope $Role.Scope `
+                    -PrincipalId $CurrentUserObjectId `
+                    -RequestType "SelfDeactivate" `
+                    -RoleDefinitionId $Role.RoleDefinitionId `
+                    -ErrorAction Stop 2>$null | Out-Null
+            }
+            catch {
+                $errorMessage = $_.Exception.Message
+                if ($errorMessage -notlike "*not found*" -and $errorMessage -notlike "*does not exist*") {
+                    throw
+                }
+            }
+        }
+        
+        Write-Host "✓ Successfully deactivated: $($Role.DisplayName) at scope: $($Role.ScopeDisplayName)" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "✗ Failed to deactivate $($Role.DisplayName) at scope: $($Role.ScopeDisplayName): $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
 # Function to activate a single role
 function Invoke-RoleActivation {
     param(
@@ -248,7 +372,7 @@ function Invoke-RoleActivation {
                 }
             }
             
-            New-MgRoleManagementDirectoryRoleAssignmentScheduleRequest -BodyParameter $params
+            New-MgRoleManagementDirectoryRoleAssignmentScheduleRequest -BodyParameter $params | Out-Null
         }
         else {
             # Azure resource role activation
@@ -326,6 +450,32 @@ try {
         $azureRoles = Get-AzureResourceEligibleRoles
     }
 
+    # Get active role assignments
+    $activeEntraRoles = Get-EntraIDActiveRoles -CurrentUser $currentUser
+    $activeAzureRoles = @()
+    if ($connections.AzContext) {
+        $activeAzureRoles = Get-AzureResourceActiveRoles -CurrentUserObjectId $currentUserObjectId
+    }
+
+    # Mark active roles in the eligible roles list
+    foreach ($role in $entraRoles) {
+        $key = "$($role.RoleDefinitionId)|$($role.DirectoryScopeId)"
+        if ($activeEntraRoles.ContainsKey($key)) {
+            $role.IsActive = $true
+            $role.ActiveAssignmentId = $activeEntraRoles[$key].AssignmentId
+            $role.ExpirationDateTime = $activeEntraRoles[$key].ExpirationDateTime
+        }
+    }
+
+    foreach ($role in $azureRoles) {
+        $key = "$($role.RoleDefinitionId)|$($role.Scope)"
+        if ($activeAzureRoles.ContainsKey($key)) {
+            $role.IsActive = $true
+            $role.ActiveAssignmentId = $activeAzureRoles[$key].AssignmentId
+            $role.ExpirationDateTime = $activeAzureRoles[$key].ExpirationDateTime
+        }
+    }
+
     # Combine all roles
     $allRoles = @()
     $allRoles += $entraRoles
@@ -336,63 +486,149 @@ try {
         exit 0
     }
 
-    Write-Host "`nFound $($entraRoles.Count) Entra ID roles and $($azureRoles.Count) Azure resource roles" -ForegroundColor Cyan
+    $activeCount = ($allRoles | Where-Object { $_.IsActive }).Count
+    Write-Host "`nFound $($entraRoles.Count) Entra ID roles and $($azureRoles.Count) Azure resource roles ($activeCount currently active)" -ForegroundColor Cyan
 
     # Display available roles
     Show-AvailableRoles -Roles $allRoles
 
-    # Prompt user for selection
-    Write-Host "Options:" -ForegroundColor Cyan
+    # Prompt user for action
+    Write-Host "Actions:" -ForegroundColor Cyan
+    Write-Host "  [A] Activate role(s)" -ForegroundColor White
+    Write-Host "  [D] Deactivate role(s)" -ForegroundColor White
+    Write-Host "  [R] Reactivate role(s) (deactivate then activate)" -ForegroundColor White
+    Write-Host "  [Q] Quit" -ForegroundColor White
+    
+    $action = Read-Host "`nSelect action (A/D/R/Q)"
+    
+    if ($action.ToUpper() -eq 'Q') {
+        Write-Host "Operation cancelled by user." -ForegroundColor Yellow
+        exit 0
+    }
+
+    if ($action.ToUpper() -notin @('A', 'D', 'R')) {
+        Write-Host "Invalid action selected." -ForegroundColor Red
+        exit 1
+    }
+
+    # Prompt user for role selection
+    Write-Host "`nOptions:" -ForegroundColor Cyan
     Write-Host "  Enter role number(s) (e.g., 1,3,5 for multiple roles)" -ForegroundColor White
-    Write-Host "  Enter 'ALL' to activate all roles" -ForegroundColor White
+    Write-Host "  Enter 'ALL' to select all roles" -ForegroundColor White
+    Write-Host "  Enter 'ACTIVE' to select all active roles" -ForegroundColor White
+    Write-Host "  Enter 'INACTIVE' to select all inactive roles" -ForegroundColor White
     Write-Host "  Enter 'Q' to quit" -ForegroundColor White
     
-    $userChoice = Read-Host "`nPlease select your option"
+    $userChoice = Read-Host "`nPlease select roles"
     
     if ($userChoice.ToUpper() -eq 'Q') {
         Write-Host "Operation cancelled by user." -ForegroundColor Yellow
         exit 0
     }
 
-    # Get justification from user
-    $justification = Read-Host "Enter justification for role activation (press Enter for default)"
-    if ([string]::IsNullOrWhiteSpace($justification)) {
-        $justification = "Administrative work requirement"
-    }
-
-    $activatedCount = 0
-    $failedCount = 0
-
+    # Determine selected roles
+    $selectedRoles = @()
     if ($userChoice.ToUpper() -eq 'ALL') {
-        # Activate all roles
-        Write-Host "`nActivating all eligible roles..." -ForegroundColor Cyan
-        
-        foreach ($role in $allRoles) {
-            if (Invoke-RoleActivation -Role $role -Justification $justification -CurrentUserObjectId $currentUserObjectId) {
-                $activatedCount++
-            } else {
-                $failedCount++
-            }
-            Start-Sleep -Seconds 1  # Brief pause between activations
+        $selectedRoles = $allRoles
+    }
+    elseif ($userChoice.ToUpper() -eq 'ACTIVE') {
+        $selectedRoles = $allRoles | Where-Object { $_.IsActive }
+        if ($selectedRoles.Count -eq 0) {
+            Write-Host "No active roles found." -ForegroundColor Yellow
+            exit 0
+        }
+    }
+    elseif ($userChoice.ToUpper() -eq 'INACTIVE') {
+        $selectedRoles = $allRoles | Where-Object { -not $_.IsActive }
+        if ($selectedRoles.Count -eq 0) {
+            Write-Host "No inactive roles found." -ForegroundColor Yellow
+            exit 0
         }
     }
     else {
-        # Activate selected roles
         $selectedNumbers = $userChoice -split ',' | ForEach-Object { $_.Trim() }
-        
         foreach ($number in $selectedNumbers) {
             if ($number -match '^\d+$' -and [int]$number -ge 1 -and [int]$number -le $allRoles.Count) {
-                $roleIndex = [int]$number - 1
-                if (Invoke-RoleActivation -Role $allRoles[$roleIndex] -Justification $justification -CurrentUserObjectId $currentUserObjectId) {
-                    $activatedCount++
-                } else {
-                    $failedCount++
-                }
-                Start-Sleep -Seconds 1  # Brief pause between activations
+                $selectedRoles += $allRoles[[int]$number - 1]
             }
             else {
                 Write-Host "Invalid selection: $number" -ForegroundColor Red
-                $failedCount++
+            }
+        }
+    }
+
+    if ($selectedRoles.Count -eq 0) {
+        Write-Host "No valid roles selected." -ForegroundColor Yellow
+        exit 0
+    }
+
+    # Get justification if activating or reactivating
+    $justification = "Administrative work requirement"
+    if ($action.ToUpper() -in @('A', 'R')) {
+        $justificationInput = Read-Host "Enter justification for role activation (press Enter for default)"
+        if (-not [string]::IsNullOrWhiteSpace($justificationInput)) {
+            $justification = $justificationInput
+        }
+    }
+
+    $successCount = 0
+    $failedCount = 0
+
+    # Perform the requested action
+    switch ($action.ToUpper()) {
+        'A' {
+            # Activate roles
+            Write-Host "`nActivating $($selectedRoles.Count) role(s)..." -ForegroundColor Cyan
+            foreach ($role in $selectedRoles) {
+                if (Invoke-RoleActivation -Role $role -Justification $justification -CurrentUserObjectId $currentUserObjectId) {
+                    $successCount++
+                } else {
+                    $failedCount++
+                }
+                Start-Sleep -Seconds 1
+            }
+        }
+        'D' {
+            # Deactivate roles
+            Write-Host "`nDeactivating $($selectedRoles.Count) role(s)..." -ForegroundColor Cyan
+            foreach ($role in $selectedRoles) {
+                if ($role.IsActive) {
+                    if (Invoke-RoleDeactivation -Role $role -CurrentUserObjectId $currentUserObjectId) {
+                        $successCount++
+                    } else {
+                        $failedCount++
+                    }
+                } else {
+                    Write-Host "⚠ Role already inactive: $($role.DisplayName) ($($role.ScopeDisplayName))" -ForegroundColor Yellow
+                }
+                Start-Sleep -Seconds 1
+            }
+        }
+        'R' {
+            # Reactivate roles (deactivate then activate)
+            Write-Host "`nReactivating $($selectedRoles.Count) role(s)..." -ForegroundColor Cyan
+            
+            # First deactivate active roles
+            $rolesToDeactivate = $selectedRoles | Where-Object { $_.IsActive }
+            if ($rolesToDeactivate.Count -gt 0) {
+                Write-Host "Step 1: Deactivating $($rolesToDeactivate.Count) active role(s)..." -ForegroundColor Cyan
+                foreach ($role in $rolesToDeactivate) {
+                    Invoke-RoleDeactivation -Role $role -CurrentUserObjectId $currentUserObjectId | Out-Null
+                    Start-Sleep -Seconds 1
+                }
+                Write-Host "Waiting 5 seconds before reactivation..." -ForegroundColor Gray
+                Start-Sleep -Seconds 5
+            }
+            
+            # Then activate all selected roles
+            Write-Host "Step 2: Activating $($selectedRoles.Count) role(s)..." -ForegroundColor Cyan
+            foreach ($role in $selectedRoles) {
+                if (Invoke-RoleActivation -Role $role -Justification $justification -CurrentUserObjectId $currentUserObjectId) {
+                    $successCount++
+                } else {
+                    $failedCount++
+                }
+                Start-Sleep -Seconds 1
             }
         }
     }
@@ -400,13 +636,16 @@ try {
     # Summary
     Write-Host "`n"
     Write-Host ("***") -ForegroundColor Green
-    Write-Host "ACTIVATION SUMMARY" -ForegroundColor Green
+    Write-Host "OPERATION SUMMARY" -ForegroundColor Green
     Write-Host ("***") -ForegroundColor Green
-    Write-Host "Successfully activated: $activatedCount roles" -ForegroundColor Green
+    Write-Host "Action: $($action.ToUpper())" -ForegroundColor Cyan
+    Write-Host "Successfully processed: $successCount role(s)" -ForegroundColor Green
     if ($failedCount -gt 0) {
-        Write-Host "Failed activations: $failedCount" -ForegroundColor Red
+        Write-Host "Failed operations: $failedCount" -ForegroundColor Red
     }
-    Write-Host "Roles will be active for 8 hours from activation time." -ForegroundColor Cyan
+    if ($action.ToUpper() -in @('A', 'R')) {
+        Write-Host "Activated roles will be active for 8 hours from activation time." -ForegroundColor Cyan
+    }
 }
 catch {
     Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
